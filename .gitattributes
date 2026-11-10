@@ -1,0 +1,9 @@
+# Windows 换行约定：让 CRLF 在跨平台保持一致，避免 diff 噪声
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 脚本与文本统一 LF
+*.js text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+LICENSE text eol=lf
