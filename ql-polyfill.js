@@ -64,10 +64,35 @@ try {
     if (!store || typeof store !== 'object' || Array.isArray(store)) store = {};
 } catch (_) { store = {}; }
 
+/* 自愈：旧版本在 invalid_grant 时会把 Config.token 写成 false / tokenTime 写成 0，
+   这份脏数据会永久压住环境变量（见下方 GM_getValue 的优先级说明）。
+   这里在启动时把被污染的字段清掉，让环境变量立刻恢复生效。
+   只在「环境变量确实提供了 refresh_token」时清理，避免误伤手动粘贴授权码的场景。 */
+const TOKEN_POLLUTED = [
+    'Config.token', 'Config.tokenTime', 'Config.accessToken', 'Config.accessTokenTime'
+];
+let healed = [];
+if (ENV.MSR_REFRESH_TOKEN) {
+    for (const k of TOKEN_POLLUTED) {
+        if (Object.prototype.hasOwnProperty.call(store, k)) {
+            const v = store[k];
+            const bad = v === false || v === null || v === 0 || v === '';
+            /* Config.token 是有效字符串时保留（可能是上一轮续期写回的新值），
+               但 false/空值一律清掉 */
+            if (bad) { delete store[k]; healed.push(k); }
+        }
+    }
+    if (healed.length) {
+        console.log('[state] 已清理被污染的字段: ' + healed.join(', ')
+            + '（旧版 token 失效时写过 false，会永久压住环境变量）');
+    }
+}
+
 function saveStore() {
     try { fs.writeFileSync(STATE_FILE, JSON.stringify(store), 'utf8'); }
     catch (e) { console.log('[state] 写入失败: ' + e.message); }
 }
+if (healed.length) saveStore();
 
 /* 环境变量映射成 GM 配置的「初始值」。
    优先级：脚本运行时写入的值 > 环境变量 > 代码自带默认值。
@@ -113,14 +138,31 @@ const hasWebhook = ['wework', 'dingding', 'feishu', 'pushme', 'bark']
 const USE_QL_NOTIFY = envBool(ENV.MSR_QL_NOTIFY, !hasWebhook);
 
 global.GM_getValue = function (key, def) {
+    /* ---- 环境变量是唯一权威来源的键：绝不允许被运行时状态覆盖 ---- */
     /* refresh_token 来自环境变量时，tokenTime 恒为「现在」：
        否则原脚本会因为「超过 7 天」主动丢弃 token 并掉进授权码流程。 */
     if (key === 'Config.tokenTime' && ENV.MSR_REFRESH_TOKEN) return Date.now();
+
+    /* 原脚本 renewToken 遇到 invalid_grant 会 GM_setValue("Config.token", false)
+       把自己写进状态文件；此后 GM_getValue 命中 store 的 false，环境变量里的
+       新 token 就永远读不到了（表现为「面板改了 token 却还在报已失效」）。
+       环境变量有值时，该键必须无条件以环境变量为准。 */
+    if (key === 'Config.token' && ENV.MSR_REFRESH_TOKEN) return ENV.MSR_REFRESH_TOKEN;
+    /* 青龙没有授权页，Config.code 恒为空，避免残留的旧授权码被反复重试 */
+    if (key === 'Config.code') return '';
+
     if (Object.prototype.hasOwnProperty.call(store, key)) return store[key];
     if (Object.prototype.hasOwnProperty.call(DEFAULTS, key)) return DEFAULTS[key];
     return def;
 };
-global.GM_setValue = function (key, val) { store[key] = val; saveStore(); };
+global.GM_setValue = function (key, val) {
+    /* 同样理由：环境变量托管的凭据不落盘，避免持久污染状态文件 */
+    if (key === 'Config.token' && ENV.MSR_REFRESH_TOKEN) return;
+    /* Cookie 来自 MSR_COOKIE 时，运行时也不需要改写它 */
+    if (key === 'Config.cookieRaw' && COOKIE_RAW) return;
+    store[key] = val;
+    saveStore();
+};
 
 /* ---------- GM_xmlhttpRequest：Node 原生 http/https ---------- */
 /* 不自动跟随重定向，保持原脚本 Utils.xhr 对 301/302 读 Location 的行为。 */
@@ -306,58 +348,107 @@ function qlProbeNetwork(done) {
     });
 }
 
-/* Cookie 有效性：只读 getuserinfo，不做任何上报动作。
-   HttpOnly cookie 用 document.cookie 读不到，只能从 F12 复制，这里正好能验出复制全没全。 */
+/* Cookie 有效性诊断：只读页面，不做任何上报动作。
+   ---------------------------------------------------------------------------
+   注意：不能用 getuserinfo 单独判定。新版 Rewards 改成 Next.js(RSC) 之后，
+   /api/getuserinfo 这个老接口即使登录态完全正常也常返回 401（票据在 .live.com
+   域，不在 rewards.bing.com 域），据此判「Cookie 无效」会大量误报。
+
+   正确的判据是「/earn 页面能不能渲染出登录后的内容」：
+     · 200 且出现服务端动作标识 / 积分字段 / 用户信息 → Cookie 能用
+     · 302 跳 login.live.com 或页面出现登录表单      → Cookie 确实没有登录态
+   getuserinfo 降级为参考信息，不再单独下结论。 */
+function qlGet(url, cookie, done) {
+    let finished = false;
+    const once = r => { if (finished) return; finished = true; done(r); };
+    const u = new NodeURL(url);
+    const req = https.request({
+        hostname: u.hostname, path: u.pathname + u.search, method: 'GET',
+        headers: {
+            'user-agent': global.navigator.userAgent,
+            'accept': 'text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8',
+            'accept-language': 'zh-CN,zh;q=0.9',
+            'referer': 'https://rewards.bing.com/',
+            'cookie': cookie
+        }
+    }, res => {
+        let s = '';
+        res.on('data', c => { if (s.length < 600000) s += c; });
+        res.on('end', () => once({
+            status: res.statusCode, location: res.headers.location || '', body: s
+        }));
+    });
+    req.setTimeout(12000, () => {
+        once({ status: 0, location: '', body: '', timeout: true });
+        try { req.destroy(); } catch (_) {}
+    });
+    req.on('error', e => once({ status: 0, location: '', body: '', error: e.message }));
+    req.end();
+}
+
 function qlProbeCookie(done) {
     if (!COOKIE_RAW) {
         console.log('[体检] Cookie 未配置 → 活动卡 / 搜索 / 领取积分等网页通道将不可用');
         return done();
     }
-    let finished = false;
-    const once = () => { if (finished) return; finished = true; done(); };
-    const u = new NodeURL('https://rewards.bing.com/api/getuserinfo?type=1'
-        + '&X-Requested-With=XMLHttpRequest&_=' + Date.now());
-    const req = https.request({
-        hostname: u.hostname, path: u.pathname + u.search, method: 'GET',
-        headers: {
-            'user-agent': global.navigator.userAgent,
-            'referer': 'https://rewards.bing.com/',
-            'x-requested-with': 'XMLHttpRequest',
-            'cookie': COOKIE_RAW
+    const names = COOKIE_LIST.map(c => c.name);
+    const SESSION_KEYS = ['_C_Auth', 'RPSAuth', 'MSPAuth', 'WLSSC', 'NAP', 'ANON'];
+    const hasSession = SESSION_KEYS.filter(k => names.includes(k));
+    console.log('[体检] Cookie 共 ' + names.length + ' 项'
+        + (hasSession.length ? '，含账户票据 ' + hasSession.join('/') : '，不含 _C_Auth/RPSAuth 等账户票据')
+        + ' → ' + names.join(', '));
+
+    /* 主判据：/earn 能否渲染登录后内容 */
+    qlGet('https://rewards.bing.com/earn', COOKIE_RAW, r => {
+        if (r.timeout) {
+            console.log('[体检] /earn 探测超时 → Cookie 有效性未知（不影响部署）');
+            return done();
         }
-    }, res => {
-        let s = '';
-        res.on('data', c => { s += c; });
-        res.on('end', () => {
-            let isJson = false;
-            try { const j = JSON.parse(s); isJson = !!(j && typeof j === 'object'); } catch (_) {}
-            if (res.statusCode === 200 && isJson) {
-                const bal = (s.match(/"(?:balance|availablePoints)"\s*:\s*"?(\d+)"?/i) || [])[1];
-                console.log('[体检] Cookie 有效 ✓（getuserinfo 返回 JSON'
-                    + (bal ? '，余额 ' + bal : '') + '）');
-            } else if (res.statusCode === 401 || res.statusCode === 403) {
-                console.log('[体检] Cookie 无效或已过期 ✗（HTTP ' + res.statusCode
-                    + '）→ 请重新从 F12 复制完整 Cookie');
+        if (!r.status) {
+            console.log('[体检] /earn 探测失败: ' + (r.error || '未知') + '（不影响部署）');
+            return done();
+        }
+        const body = r.body || '';
+        const needLogin = /login\.live\.com|oauth20_authorize|Sign in to your account|请登录/i.test(body)
+            && !/"rewards"|pointClaim|availablePoints/i.test(body);
+        const hasContent = /"dpl"|next-action|__next_f|pointClaim|availablePoints|"userInfo"/i.test(body);
+
+        if (r.status === 200 && hasContent && !needLogin) {
+            console.log('[体检] Cookie 有效 ✓（/earn 已渲染登录后内容，' + body.length + ' 字节）');
+            return done();
+        }
+        if ([301, 302, 303, 307, 308].includes(r.status) && /login\./i.test(r.location)) {
+            const isEntra = /login\.windows\.net|login\.microsoftonline\.com/i.test(r.location);
+            console.log('[体检] Cookie 无登录态 ✗（/earn 被 %d 重定向到 %s）',
+                r.status, r.location.slice(0, 70));
+            if (isEntra) {
+                /* 实测结论：新版 Rewards 走 Entra ID SSO，票据存在 login.windows.net 域，
+                   rewards.bing.com 域下可能一项认证 Cookie 都没有。Chrome 的第三方
+                   Cookie 限制会让这种情况更严重 —— 页面看着已登录，复制的 Cookie 却是空的。 */
+                console.log('[体检]   指向 Entra ID（login.windows.net）：通常不是「复制漏了」，'
+                    + '而是浏览器没把票据写进 rewards.bing.com 域');
+                console.log('[体检]   建议：① 改用 Edge 登录后重新复制（SSO 集成更完整）；'
+                    + '② 或关闭 chrome://flags/#third-party-cookie-phaseout 后重登');
+                console.log('[体检]   实测若 Edge 仍拿不到 _U / _C_Auth，说明该账号只能走 DAPI 通道：'
+                    + '建议设 MSR_TASK_PROMOS=0 MSR_TASK_CLAIMPOINTS=0 MSR_TASK_MONTHLY=0 MSR_TASK_DESKTOPWEEKLY=0');
             } else {
-                console.log('[体检] Cookie 状态不确定（HTTP ' + res.statusCode
-                    + '，响应片段 ' + s.slice(0, 80).replace(/\s+/g, ' ') + '）');
+                console.log('[体检]   → 请重新从已登录页面的 F12 → Network → 主文档请求复制 Cookie');
             }
-            once();
-        });
+            return done();
+        }
+        if (needLogin) {
+            console.log('[体检] Cookie 无登录态 ✗（/earn 返回登录页）→ 请确认 F12 是在已登录页面复制的');
+            return done();
+        }
+        console.log('[体检] Cookie 状态不确定（/earn HTTP ' + r.status
+            + '，' + body.length + ' 字节，未识别到登录后特征）');
+        done();
     });
-    req.setTimeout(12000, () => {
-        console.log('[体检] Cookie 探测超时（不影响部署）');
-        once();
-        try { req.destroy(); } catch (_) {}
-    });
-    req.on('error', e => {
-        console.log('[体检] Cookie 探测失败: ' + e.message + '（不影响部署）');
-        once();
-    });
-    req.end();
 }
 
-function qlProbe(done) { qlProbeNetwork(() => qlProbeCookie(done)); }
+function qlProbe(done) {
+    qlProbeNetwork(() => qlProbeCookie(done));
+}
 
 /* 青龙的 Cookie 来自环境变量，不依赖原脚本 getCookieHeader() 的惰性初始化。
    原脚本只在 4 个特定任务里调它，关掉那些任务后 Utils._ckReady 从未被设置，

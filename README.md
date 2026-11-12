@@ -66,12 +66,29 @@ cp .env.local.example .env.local
 ### 3. 运行
 
 ```bash
-# 只做部署体检（网络探测 + 凭据检查 + Cookie 有效性），不跑任务
+# 只做部署体检（网络探测 + 凭据来源 + Cookie 登录态），不跑任务
 MSR_CHECK=1 node msrewards_ql.js
 
 # 正常跑一轮
 node msrewards_ql.js
 ```
+
+> ⚠️ **在 SSH 里手敲 `node` 读不到青龙面板的环境变量**——面板变量只在青龙调度器
+> 执行任务时注入子进程，和你的登录 shell 是两个环境。所以 SSH 下手动跑必须显式传入：
+>
+> ```bash
+> # 方式一：env 前缀（推荐，青龙面板「手动运行」也用它）
+> env MSR_CHECK=1 MSR_REFRESH_TOKEN='...' MSR_COOKIE='...' node msrewards_ql.js
+>
+> # 方式二：先写 .env.local（脚本同目录，会被自动载入，已在 .gitignore 里）
+> printf "MSR_REFRESH_TOKEN=...\nMSR_COOKIE=...\n" > .env.local
+> MSR_CHECK=1 node msrewards_ql.js
+> ```
+>
+> **不要**在青龙任务命令里写 `MSR_CHECK=1 node xxx.js`：青龙用
+> `task-timeout.sh` 包一层 `exec "$@"`，`VAR=value cmd` 前缀赋值只在真 shell 里有效，
+> 会被当成要执行的可执行文件名，报 `MSR_CHECK=1: command not found`（退出码 127）。
+> 青龙里请写 `env MSR_CHECK=1 node xxx.js`。
 
 ### 4. 青龙定时任务
 
@@ -88,8 +105,8 @@ node msrewards_ql.js
 
 | 变量 | 必填 | 说明 |
 | --- | --- | --- |
-| `MSR_REFRESH_TOKEN` | 是 | 微软 OAuth refresh_token（DAPI / App 通道） |
-| `MSR_COOKIE` | 是 | `rewards.bing.com` 完整登录 Cookie（网页通道） |
+| `MSR_REFRESH_TOKEN` | 是 | 微软 OAuth refresh_token（DAPI / App 通道）。**该值存在时，状态文件里的同名键一律被忽略，且不会回写** |
+| `MSR_COOKIE` | 是 | `rewards.bing.com` 完整登录 Cookie（网页通道，格式 `a=1; b=2`） |
 | `MSR_WEWORK` | 否 | 企业微信群机器人 key |
 | `MSR_DINGDING` | 否 | 钉钉群机器人 access_token |
 | `MSR_FEISHU` | 否 | 飞书群机器人 hook |
@@ -119,13 +136,16 @@ node msrewards_ql.js
 ```
 msrewards_ql.js        成品单文件（青龙直接跑，由 build.js 生成）
 source.user.js         原始 UserScript（构建源，需自行放置）
-build.js               生成器：源脚本 + 9 处补丁 + 兼容层 → 成品
+build.js               生成器：源脚本 + 11 处补丁 + 兼容层 → 成品
 ql-polyfill.js         兼容层（GM_* / 浏览器全局的 Node 实现）
 get_token.js           获取 refresh_token 的工具（零插件）
 merge_cookie.js        Cookie 组合与验证工具
 diag_cookie.js         Cookie 登录态只读诊断工具
 .env.local.example     环境变量模板
 ```
+
+> `build.js` 的每一处补丁都做「必须恰好匹配 1 次」校验，上游脚本结构一变就立刻报错退出，
+> 不会静默生成一个半坏的成品。
 
 重新生成成品：
 
@@ -141,6 +161,92 @@ node build.js <路径>     # 指定源脚本
 - **依赖网页登录态的任务**（活动卡片发现、领取积分、月度计划、桌面周任务）需要有效的 `MSR_COOKIE`。新版 Rewards 网页采用 Entra ID SSO，某些场景下 Live 域票据无法直接复用，需从已登录的 `rewards.bing.com` 主文档请求复制 Cookie。
 - **需要浏览器真实点击的卡片**（带锁的 App 搜索卡等）依赖浏览器 CDP，青龙环境无浏览器，无法完成，脚本会自动跳过并标注。
 - PC 搜索等服务端结算存在几十秒到几分钟的延迟，脚本的回读可能暂时显示「未记账」，但 `NO_CREDIT_LIMIT` 兜底会继续执行，不影响最终得分。
+
+---
+
+## 故障排查
+
+### `invalid_grant` / 「检测到尚未授权」
+
+`refresh_token` 失效。重新授权：
+
+```bash
+node get_token.js                    # ① 打印授权链接
+node get_token.js '跳转后的完整地址' --save   # ② 兑换并写入 .env.local
+```
+
+> **Linux bash 下的坑**：授权码里含 `!`，双引号内会被 bash 当作历史展开，报
+> `!xxx: event not found`。请先 `set +H` 关闭历史展开，或改用**单引号**：
+>
+> ```bash
+> set +H
+> node get_token.js 'https://login.live.com/oauth20_desktop.srf?code=M.C508_...'
+> ```
+
+### Cookie 体检报「无登录态」，但浏览器页面明明显示已登录
+
+这是新版 Rewards 最常见的误解。**页面显示头像和积分 ≠ Cookie 里有票据**：
+服务端用 Entra ID 会话渲染好内容给你，票据存在 `login.windows.net` 域，
+`rewards.bing.com` 域下可能一项认证 Cookie 都没有。
+
+实测判据：拿 Cookie 直接请求 `rewards.bing.com/earn`，如果返回
+`307 → login.windows.net/consumers/oauth2/v2.0/authorize`，说明服务端不认这份凭证。
+
+**对照检查**：正常登录态至少应包含 `_U`（Bing 登录标识）。在浏览器 Console 里跑：
+
+```js
+document.cookie.split(';').map(s => s.trim().split('=')[0]).join(', ')
+```
+
+**没有 `_U` 就是没登录态**，别再反复复制了，按下面处理：
+
+1. **改用 Edge**（SSO 集成更完整）：登录后重新从 `/earn` 主文档请求复制 Cookie
+2. **Chrome 关第三方 Cookie 限制**：`chrome://flags/#third-party-cookie-phaseout` 设为 Disabled，重启后重登
+3. 以上都拿不到 → 接受现实，只用 DAPI 通道，关掉网页通道任务：
+   ```
+   MSR_TASK_PROMOS=0
+   MSR_TASK_CLAIMPOINTS=0
+   MSR_TASK_MONTHLY=0
+   MSR_TASK_DESKTOPWEEKLY=0
+   ```
+   签到 / 阅读 / 搜索 / 连签 / DAPI 每日活动仍可正常拿分（约 90~100 分/天）。
+
+### 面板里换了新 token，脚本还是报旧 token 失效
+
+旧版本在 `invalid_grant` 时会把 `Config.token` 写成 `false` 存进
+`.ms_rewards_state.json`，而 `GM_getValue` 的优先级是「状态文件 > 环境变量」，
+于是 `false` 永久压住了面板里的新值。
+
+现版本已修：启动时自动清理被污染的 `Config.token` / `Config.tokenTime` /
+`Config.accessToken` / `Config.accessTokenTime`，并且**环境变量存在时该键无条件以环境变量为准**，
+失效时也不再回写。
+
+升级到修复版后跑一次即可，日志会打印：
+
+```
+[state] 已清理被污染的字段: Config.token, Config.tokenTime（旧版 token 失效时写过 false，会永久压住环境变量）
+🔑 凭据体检：refresh_token=有（环境变量） / cookie=9 项（环境变量）
+```
+
+### 青龙报 `MSR_CHECK=1: command not found`（退出码 127）
+
+青龙用 `task-timeout.sh` 包一层 `exec "$@"`，`VAR=value cmd` 前缀赋值只在真 shell 里有效。
+改写成 `env`：
+
+```
+env MSR_CHECK=1 node yimu56_Microsoft_Rewards_QingLong/msrewards_ql.js
+```
+
+### `DAPI 响应不是 JSON: null` 反复出现
+
+几乎都是 `refresh_token` 失效的连带结果：DAPI 返回 401，响应体为空，
+`JSON.parse` 得到 null。**先修 token**，这条会成批消失，不用逐项排查。
+
+### 桌面任务 / 月度计划交卷返回 `HTTP 200` 但内容是 `$Sreact.fragment`
+
+这是 Next.js Server Action 的错误帧，不是鉴权问题。上游脚本的 `next-action` id 与
+微软前端部署版本不匹配时会出现（日志里会有「服务端标识表已更新（部署 xxx）」）。
+属于上游脚本跟进微软前端变化的固有脆弱点，等上游更新或临时关掉对应任务开关。
 
 ---
 

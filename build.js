@@ -5,7 +5,7 @@
  *   node build.js [原始脚本路径]
  *   默认源文件：同目录下的 source.user.js
  *
- * 思路：不重写 7418 行业务逻辑，只做「兼容层 + 6 处最小补丁」。
+ * 思路：不重写 7418 行业务逻辑，只做「兼容层 + 11 处最小补丁」。
  *      上游脚本更新后，重新跑一次本脚本即可。
  * ============================================================================= */
 
@@ -69,9 +69,16 @@ const QL_RUN = [
     '        const H = QL_HELPERS;',
     '        Utils.log("🚀", "青龙模式：单次执行（非常驻调度），Node " + process.version);',
     '        const hasToken = !!(process.env.MSR_REFRESH_TOKEN || GM_getValue("Config.token", false));',
-    '        Utils.log("🔑", "凭据体检：refresh_token=" + (hasToken ? "有" : "无")',
-    '            + " / cookie=" + (H.COOKIE_COUNT ? H.COOKIE_COUNT + " 项" : "无")',
+    '        const tokenSrc = process.env.MSR_REFRESH_TOKEN ? "环境变量"',
+    '            : (GM_getValue("Config.token", false) ? "状态文件" : "无");',
+    '        const cookieSrc = process.env.MSR_COOKIE ? "环境变量" : "无";',
+    '        Utils.log("🔑", "凭据体检：refresh_token=" + (hasToken ? "有（" + tokenSrc + "）" : "无")',
+    '            + " / cookie=" + (H.COOKIE_COUNT ? H.COOKIE_COUNT + " 项（" + cookieSrc + "）" : "无")',
     '            + " / sendNotify=" + (H.USE_QL_NOTIFY ? "启用" : "关闭"));',
+    '        if (!process.env.MSR_REFRESH_TOKEN && !process.env.MSR_COOKIE) {',
+    '            Utils.log("💡", "手动在 SSH 里跑 node 时听不到青龙面板的环境变量（两者是不同的执行环境）；"',
+    '                + " 青龙面板请用「手动运行」，或在本目录写 .env.local，或用 env 前缀显式传入");',
+    '        }',
     '        if (!hasToken && H.COOKIE_COUNT === 0) {',
     '            Utils.log("🔴", "未配置 MSR_REFRESH_TOKEN 或 MSR_COOKIE，本轮不会有任何积分入账");',
     '        } else if (!hasToken) {',
@@ -137,6 +144,25 @@ patch(
             if (!QL_MODE && !GM_getValue("Tasks.sign", true) && !GM_getValue("Tasks.read", true)) return true;`,
     'renewToken 提前返回');
 
+/* ④a-2 青龙下 token 来自环境变量（MSR_REFRESH_TOKEN），原脚本在 invalid_grant 时
+      会把 Config.token 写成 false 并提示「点菜单手动授权」——这两件事在青龙里
+      都是错的：① 写 false 会持久污染状态文件；② 青龙没有菜单，提示会误导。
+      这里改成只写日志，并指向真正该做的动作（更新环境变量 / 重新 get_token.js）。 */
+patch(
+`                Utils.log("🟡", "refresh_token 已失效，需要重新授权");
+                GM_setValue("Config.token", false);
+                GM_setValue("Config.tokenTime", 0);`,
+`                if (QL_MODE) {
+                    Utils.log("🟡", "refresh_token 已失效（invalid_grant）：请在本地跑 "
+                        + "node get_token.js 重新授权，把新的 MSR_REFRESH_TOKEN 填进青龙环境变量后重跑本任务");
+                    Utils.log("🟡", "青龙下不会把失效 token 写进状态文件，面板里改完环境变量下一轮即生效");
+                } else {
+                    Utils.log("🟡", "refresh_token 已失效，需要重新授权");
+                    GM_setValue("Config.token", false);
+                    GM_setValue("Config.tokenTime", 0);
+                }`,
+    '青龙下 invalid_grant 不落盘');
+
 /* ④b 修「今日获取」恒为 +0：getBalance 依赖 access_token，必须放在 renewToken 之后。
       原脚本先读余额再刷 Token，token 未就绪时 DAPI 通道 withTokenRetry 直接返回 null，
       于是 startBalance=0，earned 的 (startBalance>0 && endBalance>0) 判定永远不成立。 */
@@ -164,6 +190,17 @@ const BALANCE_TO = [
     '                Utils.log("📊", "初始积分: " + startBalance);'
 ].join('\n');
 patch(BALANCE_FROM, BALANCE_TO, '余额读取顺序');
+
+    '青龙下没有浏览器上下文，这条提示原文是「需用 Chrome 浏览器运行脚本」，',
+    '跑在青龙里永远不会成立，只会误导。改成如实的青龙语义说明。 */',
+patch(
+`                            + "\\n💡 上面三项要自动完成，需用 Chrome 浏览器运行脚本";`,
+`                            + (QL_MODE
+                                ? "\\n💡 青龙无浏览器上下文：这些项需要网页登录态(Cookie)或真实点击，"
+                                  + "Cookie 失效或被 Entra SSO 拦截时会一直卡在这里。"
+                                  + "可用 MSR_TASK_PROMOS=0 / MSR_TASK_DESKTOPWEEKLY=0 / MSR_TASK_MONTHLY=0 关掉以减少无效耗时"
+                                : "\\n💡 上面三项要自动完成，需用 Chrome 浏览器运行脚本");`,
+    '青龙下改写浏览器提示');
 
 /* ⑤ 去掉后台上下文的「永不 resolve 保活」，否则青龙任务永远不结束 */
 patch(
@@ -197,4 +234,4 @@ const banner = [
 fs.writeFileSync(OUT, banner + polyfill + '\n' + src, 'utf8');
 console.log('[build] 已生成: ' + OUT);
 console.log('[build] 成品行数: ' + (banner + polyfill + '\n' + src).split('\n').length);
-console.log('[build] 补丁: 9/9 全部命中');
+console.log('[build] 补丁: 11/11 全部命中');
